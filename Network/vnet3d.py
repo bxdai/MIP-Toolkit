@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tensorboardX import SummaryWriter
 
 #https://github.com/mattmacy/vnet.pytorch/blob/master/vnet.py
 
@@ -180,9 +181,17 @@ class VNet(nn.Module):
         out = self.up_tr32(out, out16)
         out = self.out_tr(out)
         return out
-   
+
+def test_graph():
+    dummy_input = torch.rand(1,1,128,128,64) #假设输入13张1*28*28的图片
+    model = VNet()
+    with SummaryWriter(comment='VNet') as w:
+        w.add_graph(model, (dummy_input, ))
+
 if __name__ == '__main__':
     from torchsummary import summary
     vnet = VNet()
     vnet.to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
     summary(vnet,(1,128,128,64))
+    test_graph()
+
