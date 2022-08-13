@@ -12,6 +12,9 @@ import math
 
 
 class SingleDeconv3DBlock(nn.Module):
+    '''
+    使用转置卷积来实现上采样
+    '''
     def __init__(self, in_planes, out_planes):
         super().__init__()
         self.block = nn.ConvTranspose3d(in_planes, out_planes, kernel_size=2, stride=2, padding=0, output_padding=0)
@@ -31,6 +34,10 @@ class SingleConv3DBlock(nn.Module):
 
 
 class Conv3DBlock(nn.Module):
+    '''
+    decoder的三维卷积模块
+    conv3x3x3,BN,Relu
+    '''
     def __init__(self, in_planes, out_planes, kernel_size=3):
         super().__init__()
         self.block = nn.Sequential(
@@ -44,6 +51,10 @@ class Conv3DBlock(nn.Module):
 
 
 class Deconv3DBlock(nn.Module):
+    '''
+    反卷积上采样模块
+    deconv2x2x2,conv3x3x3,BN,Relu
+    '''
     def __init__(self, in_planes, out_planes, kernel_size=3):
         super().__init__()
         self.block = nn.Sequential(
@@ -59,7 +70,9 @@ class Deconv3DBlock(nn.Module):
 
 class SelfAttention(nn.Module):
     '''
-
+    transformer结构的核心模块:自注意力模块
+    学习Wq,Wk,Wv矩阵
+    # 输入和输出是相同的的尺寸[B,Seq_dim,embded_dim]
     '''
     def __init__(self, num_heads, embed_dim, dropout):
         super().__init__()
@@ -67,6 +80,7 @@ class SelfAttention(nn.Module):
         self.attention_head_size = int(embed_dim / num_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
+        #query,key,value 具体实现是一个线性层(全量就层) 输入维度是K/n,输出维度是K
         self.query = nn.Linear(embed_dim, self.all_head_size)
         self.key = nn.Linear(embed_dim, self.all_head_size)
         self.value = nn.Linear(embed_dim, self.all_head_size)
@@ -80,6 +94,8 @@ class SelfAttention(nn.Module):
         self.vis = False
 
     def transpose_for_scores(self, x):
+        #x.shape=[1,512,768]
+        # reshape tensor 到需要的维度[B,embded_dim,heads,head_size] torch.Size([1, 512, 12, 64])
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
@@ -93,22 +109,33 @@ class SelfAttention(nn.Module):
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        # Q 和 K 计算出 scores，然后将 scores 和 V 相乘，得到每个patch的context vector
+        
+        #1.SA(z) = Softmax( qk> √Ch )v,计算出 scores
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) # torch.Size([1, 12, 512, 512])
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         attention_probs = self.softmax(attention_scores)
+
         weights = attention_probs if self.vis else None
         attention_probs = self.attn_dropout(attention_probs)
-
+        #2.scores 和 V 相乘
         context_layer = torch.matmul(attention_probs, value_layer)
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()#torch.Size([1, 12, 512, 64])
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)#torch.Size([1, 512, 768])
         context_layer = context_layer.view(*new_context_layer_shape)
+        # 最后的一个线性输出层
         attention_output = self.out(context_layer)
+        #加了一个dropout层
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
 
 class Mlp(nn.Module):
+    '''
+    MLP 层
+    采用高斯误差线性单元激活函数GELU
+    zi = MLP(Norm(z0i)) + z0i,
+    '''
     def __init__(self, in_features, act_layer=nn.GELU, drop=0.):
         super().__init__()
         self.fc1 = nn.Linear(in_features, in_features)
@@ -123,11 +150,18 @@ class Mlp(nn.Module):
 
 
 class PositionwiseFeedForward(nn.Module):
+    '''
+    位置级前馈网络
+    除了注意子层外,我们的编码器和解码器中的每个层都包含一个完全连接的前馈网络.
+    它分别和相同地应用于每个位置。这由两个线性变换组成.中间有一个ReLU激活。
+    FFN(x) = max(0, xW1 + b1)W2 + b2 (2)
+    '''
     def __init__(self, d_model=786, d_ff=2048, dropout=0.1):
         super().__init__()
         # Torch linears have a `b` by default.
         self.w_1 = nn.Linear(d_model, d_ff)
         self.w_2 = nn.Linear(d_ff, d_model)
+        #Residual Dropout
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -136,46 +170,69 @@ class PositionwiseFeedForward(nn.Module):
 
 class Embeddings(nn.Module):
     '''
+    embedded patches
 
     '''
     def __init__(self, input_dim, embed_dim, cube_size, patch_size, dropout):
         super().__init__()
+        #计算有多少个patch
         self.n_patches = int((cube_size[0] * cube_size[1] * cube_size[2]) / (patch_size * patch_size * patch_size))
+        # patch的大小
         self.patch_size = patch_size
+        # 嵌入的尺寸大小，默认768
         self.embed_dim = embed_dim
+        #使用3D卷积计算patch embedding
+        # 在NLP中语言序列是1D的序列使用朋友torch中的nn.Embedding()
         self.patch_embeddings = nn.Conv3d(in_channels=input_dim, out_channels=embed_dim,
                                           kernel_size=patch_size, stride=patch_size)
+        # 设置一个可以学习的嵌入位置参数
+        #将一个固定不可训练的tensor转换成可以训练的类型parameter，并将这个parameter绑定到这个module里面(net.parameter()中就有这个绑定的parameter，所以在参数优化的时候可以进行优化的)，
+        # 所以经过类型转换这个self.position_embeddings变成了模型的一部分，成为了模型中根据训练可以改动的参数了。
+        # 使用这个函数的目的也是想让某些变量在学习的过程中不断的修改其值以达到最优化
         self.position_embeddings = nn.Parameter(torch.zeros(1, self.n_patches, embed_dim))
+        #dropout 层
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        #[1,4,128,128,128]->[1,768,8,8,8]
         x = self.patch_embeddings(x)
+        #从dim=2开始展平->[1,768,512]
         x = x.flatten(2)
-        x = x.transpose(-1, -2)
+        x = x.transpose(-1, -2) #[1,512,768]
+        # 直接加上位置信息
         embeddings = x + self.position_embeddings
         embeddings = self.dropout(embeddings)
         return embeddings
 
 
 class TransformerBlock(nn.Module):
+    '''
+    可重复的transformer block 
+    Norm->MSA->Norm->MLP
+    '''
     def __init__(self, embed_dim, num_heads, dropout, cube_size, patch_size):
         super().__init__()
+        #归一化，在一个样本上做归一化操作这里是laerNorm 而不是BatchNorm
         self.attention_norm = nn.LayerNorm(embed_dim, eps=1e-6)
         self.mlp_norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        #mlp dim
         self.mlp_dim = int((cube_size[0] * cube_size[1] * cube_size[2]) / (patch_size * patch_size * patch_size))
         self.mlp = PositionwiseFeedForward(embed_dim, 2048)
         self.attn = SelfAttention(num_heads, embed_dim, dropout)
 
     def forward(self, x):
         h = x
+        #1.NORM
         x = self.attention_norm(x)
+        #2.MSA
         x, weights = self.attn(x)
+        # 残差链接
         x = x + h
         h = x
-
+        #3.MLP
         x = self.mlp_norm(x)
         x = self.mlp(x)
-
+        #残差链接
         x = x + h
         return x, weights
 
@@ -227,10 +284,10 @@ class Transformer(nn.Module):
 
 
 class UNETR(nn.Module):
-    def __init__(self, img_shape=(128, 128, 128), input_dim=4, output_dim=3, embed_dim=768, patch_size=16, num_heads=12, dropout=0.1):
+    def __init__(self, img_shape=(128, 128, 128), in_channels=4, out_channels=3, embed_dim=768, patch_size=16, num_heads=12, dropout=0.1):
         super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.embed_dim = embed_dim
         self.img_shape = img_shape
         self.patch_size = patch_size
@@ -244,7 +301,7 @@ class UNETR(nn.Module):
         # Transformer Encoder
         self.transformer = \
             Transformer(
-                input_dim,
+                in_channels,
                 embed_dim,
                 img_shape,
                 patch_size,
@@ -257,7 +314,7 @@ class UNETR(nn.Module):
         # U-Net Decoder
         self.decoder0 = \
             nn.Sequential(
-                Conv3DBlock(input_dim, 32, 3),
+                Conv3DBlock(in_channels, 32, 3),
                 Conv3DBlock(32, 64, 3)
             )
 
@@ -284,7 +341,7 @@ class UNETR(nn.Module):
             nn.Sequential(
                 Conv3DBlock(1024, 512),
                 Conv3DBlock(512, 512),
-                Conv3DBlock(512, 512),
+                #Conv3DBlock(512, 512),
                 SingleDeconv3DBlock(512, 256)
             )
 
@@ -306,7 +363,7 @@ class UNETR(nn.Module):
             nn.Sequential(
                 Conv3DBlock(128, 64),
                 Conv3DBlock(64, 64),
-                SingleConv3DBlock(64, output_dim, 1)
+                SingleConv3DBlock(64, out_channels, 1)
             )
 
     def forward(self, x):
@@ -344,11 +401,12 @@ if __name__ == '__main__':
     # 使用torchsummary时报错AttributeError: ‘list‘ object has no attribute ‘size‘
     # https://blog.csdn.net/huanjin_w/article/details/110858744
     # 最新版本的 torch-summary 1.4.5解决了这个问题
-    # torch-summary已经重命名为torchinfo
+    # torch-summary已经重命名为torchinfo，建议使用torchinfo
     #https://pypi.org/project/torch-summary/
     #https://pypi.org/project/torchinfo/
-    from torchsummary import summary
-    unetr = UNETR(input_dim=3)
+    #from torchsummary import summary
+    from torchinfo import summary
+    unetr = UNETR()
     #print(unetr)
     unetr.to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
-    summary(unetr,(3,128,128,128))
+    summary(unetr,(1,4,128,128,128))
