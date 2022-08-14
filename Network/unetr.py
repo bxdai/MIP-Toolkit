@@ -367,8 +367,9 @@ class UNETR(nn.Module):
             )
 
     def forward(self, x):
-        z = self.transformer(x)
+        z = self.transformer(x)#z=[4,1,512,768]
         z0, z3, z6, z9, z12 = x, *z
+        #[1,512,768]->[1,768,8,8,8]
         z3 = z3.transpose(-1, -2).view(-1, self.embed_dim, *self.patch_dim)
         z6 = z6.transpose(-1, -2).view(-1, self.embed_dim, *self.patch_dim)
         z9 = z9.transpose(-1, -2).view(-1, self.embed_dim, *self.patch_dim)
